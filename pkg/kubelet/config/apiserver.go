@@ -1,0 +1,69 @@
+/*
+Copyright 2015 The Kubernetes Authors.
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+*/
+
+package config
+
+import (
+	"context"
+	"time"
+
+	v1 "k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/types"
+	clientset "k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/tools/cache"
+	"k8s.io/klog/v2"
+)
+
+// WaitForAPIServerSyncPeriod is the period between checks for the node list/watch initial sync
+const WaitForAPIServerSyncPeriod = 1 * time.Second
+
+// NewSourceApiserver creates a config source that watches and pulls from the apiserver.
+func NewSourceApiserver(logger klog.Logger, c clientset.Interface, nodeName types.NodeName, nodeHasSynced func() bool, updates chan<- sourceUpdate) {
+	lw := cache.NewListWatchFromClient(c.CoreV1().RESTClient(), "pods", metav1.NamespaceAll, fields.OneTermEqualSelector("spec.nodeName", string(nodeName)))
+
+	// The Reflector responsible for watching pods at the apiserver should be run only after
+	// the node sync with the apiserver has completed.
+	logger.Info("Waiting for node sync before watching apiserver pods")
+	go func() {
+		for {
+			if nodeHasSynced() {
+				logger.V(4).Info("node sync completed")
+				break
+			}
+			time.Sleep(WaitForAPIServerSyncPeriod)
+			logger.V(4).Info("node sync has not completed yet")
+		}
+		logger.Info("Watching apiserver")
+		newSourceApiserverFromLW(logger, lw, updates)
+	}()
+}
+
+// newSourceApiserverFromLW holds creates a config source that watches and pulls from the apiserver.
+func newSourceApiserverFromLW(logger klog.Logger, lw cache.ListerWatcher, updates chan<- sourceUpdate) {
+	send := func(objs []interface{}) {
+		var pods []*v1.Pod
+		for _, o := range objs {
+			pods = append(pods, o.(*v1.Pod))
+		}
+		updates <- sourceUpdate{Pods: pods}
+	}
+	r := cache.NewReflectorWithOptions(lw, &v1.Pod{}, cache.NewUndeltaStore(send, cache.MetaNamespaceKeyFunc), cache.ReflectorOptions{
+		Logger: &logger,
+	})
+	go r.RunWithContext(klog.NewContext(context.Background(), logger))
+}
